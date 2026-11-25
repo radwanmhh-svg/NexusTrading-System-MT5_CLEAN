@@ -1,14 +1,11 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { TradingMode, Timeframe, LayoutItem, AccountInfo } from '@/types';
+import type { Timeframe, LayoutItem, AccountInfo } from '@/types';
 
 interface DashboardState {
   /* Trading state */
   symbol: string;
   timeframe: Timeframe;
-  mode: TradingMode;
-  autoTradeEnabled: boolean;
-  isKilled: boolean;
 
   /* Account */
   account: AccountInfo;
@@ -20,11 +17,6 @@ interface DashboardState {
   /* Actions */
   setSymbol: (symbol: string) => void;
   setTimeframe: (tf: Timeframe) => void;
-  setMode: (mode: TradingMode) => void;
-  toggleAutoTrade: () => void;
-  setAutoTrade: (enabled: boolean) => void;
-  activateKillSwitch: () => void;
-  deactivateKillSwitch: () => void;
   setAccount: (account: Partial<AccountInfo>) => void;
   setGridLayout: (layout: LayoutItem[]) => void;
   toggleSidebar: () => void;
@@ -50,9 +42,6 @@ export const useDashboardStore = create<DashboardState>()(
     (set) => ({
       symbol: 'XAUUSD',
       timeframe: 'M15',
-      mode: 'PAPER',
-      autoTradeEnabled: true,
-      isKilled: false,
 
       account: {
         balance: 0,
@@ -68,13 +57,6 @@ export const useDashboardStore = create<DashboardState>()(
 
       setSymbol: (symbol) => set({ symbol }),
       setTimeframe: (timeframe) => set({ timeframe }),
-      setMode: (mode) => set({ mode }),
-      toggleAutoTrade: () =>
-        set((s) => ({ autoTradeEnabled: !s.autoTradeEnabled })),
-      setAutoTrade: (enabled) => set({ autoTradeEnabled: enabled }),
-      activateKillSwitch: () =>
-        set({ isKilled: true, autoTradeEnabled: false }),
-      deactivateKillSwitch: () => set({ isKilled: false }),
       setAccount: (account) =>
         set((s) => ({ account: { ...s.account, ...account } })),
       setGridLayout: (gridLayout) => set({ gridLayout }),
@@ -83,22 +65,22 @@ export const useDashboardStore = create<DashboardState>()(
     }),
     {
       name: 'nexus-dashboard',
-      version: 3,
+      version: 4,
       partialize: (state) => ({
         symbol: state.symbol,
         timeframe: state.timeframe,
-        mode: state.mode,
-        autoTradeEnabled: state.autoTradeEnabled,
         gridLayout: state.gridLayout,
         sidebarCollapsed: state.sidebarCollapsed,
       }),
       migrate: (persisted: unknown) => {
-        const state = persisted as unknown as Partial<DashboardState>;
-        // Ensure symbol is always one of our valid symbols
-        if (state?.symbol && !['XAUUSD', 'BTCUSD'].includes(state.symbol)) {
-          state.symbol = 'XAUUSD';
-        }
-        return state as DashboardState;
+        // Whitelist preferences. Old snapshots contained optimistic trading state.
+        const s = (persisted ?? {}) as Partial<DashboardState>;
+        return {
+          symbol: s.symbol && ['XAUUSD', 'BTCUSD'].includes(s.symbol) ? s.symbol : 'XAUUSD',
+          timeframe: s.timeframe ?? 'M15',
+          gridLayout: s.gridLayout ?? DEFAULT_LAYOUT,
+          sidebarCollapsed: s.sidebarCollapsed ?? false,
+        };
       },
     }
   )

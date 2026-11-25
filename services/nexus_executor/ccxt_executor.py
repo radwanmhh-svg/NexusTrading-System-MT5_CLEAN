@@ -147,7 +147,10 @@ class CCXTExecutor(BrokerAdapter):
                 )
 
             ccxt_status = result.get("status", "")
-            if ccxt_status == "closed":
+            filled = float(result.get("filled") or 0)
+            if filled > 0 and filled < order.size and ccxt_status in {"open", "closed", "canceled"}:
+                status = OrderStatus.PARTIAL
+            elif ccxt_status == "closed":
                 status = OrderStatus.FILLED
             elif ccxt_status == "open":
                 status = OrderStatus.PENDING
@@ -176,8 +179,9 @@ class CCXTExecutor(BrokerAdapter):
                 side=side.upper(),
                 order_type=order.order_type.value,
                 requested_price=order.price,
-                fill_price=float(result.get("average", 0) or result.get("price", 0) or 0),
-                size=float(result.get("filled", 0) or order.size),
+                # An order price or requested quantity is not evidence of a fill.
+                fill_price=float(result.get("average") or 0),
+                size=filled,
                 sl=order.sl,
                 tp=order.tp,
                 status=status,
@@ -356,6 +360,7 @@ class CCXTExecutor(BrokerAdapter):
             usdt_free = float(free.get("USDT", 0) or free.get("USD", 0) or 0)
 
             return AccountInfo(
+                execution_mode="paper" if self._connected and self._sandbox else None,
                 balance=usdt_total,
                 equity=usdt_total,
                 free_margin=usdt_free,

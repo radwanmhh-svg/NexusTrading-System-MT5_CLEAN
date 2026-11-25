@@ -14,6 +14,7 @@ import {
   FlaskConical,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useTradeControls } from '@/stores/tradeControls';
 import AgentFlowchart from '@/components/windows/AgentFlowchart';
 import ActivePositions from '@/components/windows/ActivePositions';
 import AgentConsole from '@/components/windows/AgentConsole';
@@ -91,22 +92,11 @@ function ReconcileBanner() {
 }
 
 function HonestStatusBanner() {
-  const [mode, setMode] = React.useState<string>('');
-  const [ttlH, setTtlH] = React.useState<number | null>(null);
-  React.useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:9000'}/api/system/mode`)
-      .then((r) => r.json())
-      .then((d) => {
-        setMode(d?.mode ?? 'paper');
-        // T15.7: ساعات متبقية قبل انسحاب وضع الجلسة تلقائياً (TTL يوم)
-        setTtlH(d?.session_ttl_sec ? Math.round(d.session_ttl_sec / 3600) : null);
-      })
-      .catch(() => setMode('unknown'));
-  }, []);
-  if (mode === 'live') return null;
+  const mode = useTradeControls(s => s.snapshot?.mode);
+  if (!mode || mode === 'live') return null;
   const label = mode === 'shadow'
-    ? 'SHADOW — الصفقات تُسجَّل فقط ولا تُنفَّذ'
-    : 'PAPER/SHADOW-ONLY — لا نموذج معتمد للتداول (حكم قبول P14 الصادق)';
+    ? 'SHADOW — لا تُرسل أوامر جديدة إلى الوسيط'
+    : mode === 'backtest' ? 'BACKTEST — لا تُرسل أوامر إلى الوسيط' : 'PAPER — التنفيذ يتطلب حسابًا تجريبيًا مؤكّدًا';
   return (
     <div className="px-3 py-1 bg-neon-gold/10 border-b border-neon-gold/30 flex items-center gap-2 shrink-0">
       <span className="h-1.5 w-1.5 rounded-full bg-neon-gold animate-pulse shrink-0" />
@@ -116,11 +106,6 @@ function HonestStatusBanner() {
       <span className="text-[10px] font-mono text-text-muted" dir="auto">
         · التفعيل يتطلب: تجاوز baseline + PF&gt;1.15 خارج العينة + دورة shadow حية ناجحة
       </span>
-      {ttlH != null && (
-        <span className="text-[10px] font-mono text-neon-gold/80" dir="auto">
-          · انسحاب الوضع خلال ~{ttlH} ساعة (TTL)
-        </span>
-      )}
     </div>
   );
 }

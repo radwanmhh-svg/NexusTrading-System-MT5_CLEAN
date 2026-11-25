@@ -14,6 +14,7 @@ interface AutonomousStats {
   trades_approved: number;
   trades_rejected: number;
   last_cycle: string;
+  last_execution?: { symbol: string; outcome: string; order_id?: string; executor_status?: string; timestamp?: string } | null;
   last_signal: {
     symbol?: string;
     direction?: string;
@@ -183,6 +184,11 @@ export default function AutonomousMLPanel() {
             <p className="text-sm font-bold font-mono text-neon-cyan">{approvalRate}%</p>
           </div>
         </div>
+
+        <p className="text-[10px] font-mono text-text-secondary">
+          Last execution receipt: {stats?.last_execution ?
+            `${stats.last_execution.symbol} · ${stats.last_execution.outcome} · ${stats.last_execution.executor_status ?? 'no acknowledgement'}${stats.last_execution.order_id ? ' #' + stats.last_execution.order_id : ''}` : 'none'}
+        </p>
 
         {/* Last Signal */}
         {sig.direction && (

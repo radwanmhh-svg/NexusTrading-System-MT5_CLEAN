@@ -155,8 +155,6 @@ const RUNTIME_SECTIONS: SettingSection[] = [
 
 // ── Local UI settings (stored in localStorage, also synced to gateway) ─────────
 const DEFAULT_LOCAL = {
-  paperMode: true,
-  autoTrade: false,
   soundAlerts: true,
   desktopNotifications: false,
 };
@@ -175,7 +173,10 @@ export default function SettingsPage() {
     if (typeof window === 'undefined') return DEFAULT_LOCAL;
     try {
       const raw = localStorage.getItem(UI_SETTINGS_STORAGE_KEY);
-      if (raw) return { ...DEFAULT_LOCAL, ...JSON.parse(raw) };
+      if (raw) {
+        const stored = JSON.parse(raw);
+        return { soundAlerts: stored?.soundAlerts ?? true, desktopNotifications: stored?.desktopNotifications ?? false };
+      }
     } catch {}
     return DEFAULT_LOCAL;
   });
@@ -213,8 +214,6 @@ export default function SettingsPage() {
   }, []);
 
   useEffect(() => {
-    const st = useDashboardStore.getState();
-    setLocal((p) => ({ ...p, paperMode: st.mode === 'PAPER', autoTrade: st.autoTradeEnabled }));
     loadAll();
     const t = setInterval(loadAll, 30000);
     return () => clearInterval(t);
@@ -249,11 +248,7 @@ export default function SettingsPage() {
       // Save local settings
       localStorage.setItem(UI_SETTINGS_STORAGE_KEY, JSON.stringify(local));
       const store = useDashboardStore.getState();
-      store.setAutoTrade(local.autoTrade);
-      store.setMode(local.paperMode ? 'PAPER' : 'LIVE');
       await apiClient.putGatewaySettings({
-        trading_mode: local.paperMode ? 'paper' : 'live',
-        auto_trade_enabled: local.autoTrade,
         default_symbol: store.symbol,
         default_timeframe: store.timeframe,
       });
@@ -307,21 +302,14 @@ export default function SettingsPage() {
         {/* Left: runtime + local sections */}
         <div className="flex-1 min-w-0 flex flex-col gap-3">
 
-          {/* ── Local section (paper mode / auto trade) ── */}
+          {/* ── Local display preferences ── */}
           <SectionCard
             id="local" label="Operación" icon={Globe} color="text-text-secondary"
             expanded={expanded} setExpanded={setExpanded}
           >
-            <FieldRow
-              field={{ key: 'paperMode', label: 'Paper Mode', type: 'boolean', description: 'Opera con dinero simulado. Desactiva para usar cuenta MT5 real.' }}
-              value={local.paperMode}
-              onChange={(v) => setLocalField('paperMode', v)}
-            />
-            <FieldRow
-              field={{ key: 'autoTrade', label: 'Auto-Trade', type: 'boolean', description: 'Permite a los agentes ejecutar trades automáticamente en MT5.' }}
-              value={local.autoTrade}
-              onChange={(v) => setLocalField('autoTrade', v)}
-            />
+            <p className="text-xs text-text-secondary">
+              El modo y AUTO se controlan desde el panel de Trading. Guardar preferencias no cambia la ejecución.
+            </p>
             <FieldRow
               field={{ key: 'soundAlerts', label: 'Alertas de sonido', type: 'boolean', description: 'Sonido en ejecución de trades y señales.' }}
               value={local.soundAlerts}

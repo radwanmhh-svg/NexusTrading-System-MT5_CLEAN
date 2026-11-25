@@ -22,6 +22,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from shared.nexus_trades import build_nexus_comment
+from .order_receipt import submit_entry
 from .traders.base_trader import TradeSignal, ModelPerformance, get_pip_value
 from .traders.ml_trader import MLTrader
 from .traders.dl_trader import DLTrader
@@ -156,6 +157,7 @@ _autonomous_stats: dict[str, Any] = {
     "trades_rejected": 0,
     "last_cycle": "",
     "last_signal": {},
+    "last_execution": None,
     "errors": 0,
 }
 
@@ -774,6 +776,7 @@ async def autonomous_status():
         "trades_rejected": _autonomous_stats["trades_rejected"],
         "last_cycle": _autonomous_stats["last_cycle"],
         "last_signal": _autonomous_stats["last_signal"],
+        "last_execution": _autonomous_stats["last_execution"],
         "errors": _autonomous_stats["errors"],
         "mode": get_current_mode().value,
         "dynamic_tf": await _read_dynamic_tf() or {},
@@ -1289,40 +1292,23 @@ async def _autonomous_cycle(
                         pass
 
                     # Send order directly to executor service for actual execution
-                    try:
-                        order_payload = {
-                            "symbol": symbol,
-                            "side": consensus.direction,
-                            "order_type": "MARKET",
-                            "size": approved_size,
-                            "sl": round(sl_price, 5),
-                            "tp": round(tp_price, 5),
-                            "comment": build_nexus_comment("automl", tag=cfg.mode.value),
-                            "strategy": "automl",
-                            "conviction": round(consensus.confidence, 3),
-                            "session": session.value,
-                            "atr": round(float(atr or 0), 6),
-                            "regime": str(trend_regime or ""),
-                        }
-                        exec_resp = await client.post(
-                            f"{executor_url}/api/executor/order",
-                            json=order_payload,
-                        )
-                        if exec_resp.status_code == 200:
-                            exec_result = exec_resp.json()
-                            logger.info(
-                                "Autonomous ML EXECUTED: %s %s order_id=%s fill=%.5f",
-                                symbol, consensus.direction,
-                                exec_result.get("order_id", ""),
-                                exec_result.get("fill_price", 0),
-                            )
-                        else:
-                            logger.warning(
-                                "Autonomous ML execution failed: %d %s",
-                                exec_resp.status_code, exec_resp.text[:200],
-                            )
-                    except Exception:
-                        logger.error("Autonomous ML executor call failed", exc_info=True)
+                    order_payload = {
+                        "symbol": symbol,
+                        "side": consensus.direction,
+                        "order_type": "MARKET",
+                        "size": approved_size,
+                        "sl": round(sl_price, 5),
+                        "tp": round(tp_price, 5),
+                        "comment": build_nexus_comment("automl", tag=cfg.mode.value),
+                        "strategy": "automl",
+                        "conviction": round(consensus.confidence, 3),
+                        "session": session.value,
+                        "atr": round(float(atr or 0), 6),
+                        "regime": str(trend_regime or ""),
+                    }
+                    receipt = await submit_entry(client, executor_url, order_payload)
+                    _autonomous_stats["last_execution"] = receipt
+                    logger.info("Autonomous ML execution receipt: %s %s %s", symbol, consensus.direction, receipt["outcome"])
                 else:
                     _autonomous_stats["trades_rejected"] += 1
                     logger.info(

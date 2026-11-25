@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from shared.config_loader import ConfigLoader
 from shared.constants import RedisStream, ServiceName
+from shared.execution_receipt import execution_veto
 from shared.events import (
     OrderEvent,
     PositionUpdateEvent,
@@ -33,6 +35,7 @@ from shared.nexus_trades import (
     strategy_from_comment,
 )
 from shared.redis_client import RedisClient
+from shared.trade_controls import EntryBlocked, halted, read_controls
 
 from .broker_adapter import (
     AccountInfo,
@@ -45,7 +48,7 @@ from .broker_adapter import (
 )
 from .ccxt_executor import CCXTExecutor
 from .ibkr_executor import IBKRExecutor
-from .mt5_executor import MT5Executor
+from .entry_gate import dispatch_entry
 from .smart_routing import SmartRouter
 
 from shared import setup_logger as _setup_logger
@@ -144,14 +147,13 @@ async def _open_same_direction_count(symbol: str, side: str) -> int:
 async def _stacking_blocked(symbol: str, side: str) -> bool:
     """True when MAX_PER_DIRECTION Nexus positions already exist same-direction.
 
-    Fails open (False) if the broker is unreachable so a positions glitch
-    cannot freeze trading entirely — the Redis dedup still applies then.
+    A position-inventory exception at this boundary must not authorize entry.
     """
     try:
         return await _open_same_direction_count(symbol, side) >= MAX_PER_DIRECTION
     except Exception:
         log.exception("executor.stacking_check_failed", symbol=symbol, side=side)
-        return False
+        raise EntryBlocked("position_inventory_unavailable")
 
 
 # ── Last-line lot cap at the broker gateway ──────────────────────────────────
@@ -317,6 +319,7 @@ _broker_connected = False
 
 def _create_broker(broker_type: str) -> BrokerAdapter:
     if broker_type == "mt5":
+        from .mt5_executor import MT5Executor
         return MT5Executor()
     elif broker_type == "ibkr":
         return IBKRExecutor()
@@ -324,8 +327,7 @@ def _create_broker(broker_type: str) -> BrokerAdapter:
         exchange_id = broker_type if broker_type != "ccxt" else "binance"
         return CCXTExecutor(exchange_id=exchange_id)
     else:
-        log.warning("executor.unknown_broker", broker=broker_type, fallback="mt5")
-        return MT5Executor()
+        raise ValueError(f"Unsupported broker type: {broker_type}")
 
 
 async def _get_broker() -> BrokerAdapter:
@@ -347,7 +349,7 @@ class SendOrderRequest(BaseModel):
     symbol: str
     side: str
     order_type: str = "MARKET"
-    size: float = 0.01
+    size: float = Field(default=0.01, gt=0, allow_inf_nan=False)
     price: float = 0.0
     sl: float = 0.0
     tp: float = 0.0
@@ -405,7 +407,7 @@ async def _execution_stream_consumer() -> None:
                 continue
 
             event_data = event.data if isinstance(event.data, dict) else {}
-            if event_data.get("skip_execution") or event_data.get("already_executed"):
+            if execution_veto(event_data, "skip_execution") or execution_veto(event_data, "already_executed"):
                 log.info(
                     "executor.stream_consumer.skip_already_executed",
                     symbol=event_data.get("symbol", getattr(event, "symbol", "")),
@@ -413,19 +415,37 @@ async def _execution_stream_consumer() -> None:
                 )
                 continue
             symbol = event_data.get("symbol", getattr(event, "symbol", ""))
-            side = event_data.get("side", event_data.get("direction", "BUY"))
-            size = float(getattr(event, "approved_size", 0.01))
+            side = str(event_data.get("side") or event_data.get("direction") or "").upper()
+            size = float(getattr(event, "approved_size", 0))
             entry = float(event_data.get("entry", event_data.get("price", 0)) or 0)
             sl = float(event_data.get("sl", 0) or 0)
             tp = float(event_data.get("tp", event_data.get("tp1", 0)) or 0)
 
-            if not symbol or size <= 0:
+            if not symbol or not math.isfinite(size) or size <= 0:
                 log.warning(
                     "executor.skipping_incomplete_decision",
                     symbol=symbol,
                     size=size,
                     has_data=bool(event_data),
                 )
+                continue
+
+            controls = await read_controls(redis)
+            if controls.block:
+                if controls.block == "shadow" and entry > 0:
+                    from services.nexus_agents.shadow_trades import record_shadow_trade
+                    await record_shadow_trade(
+                        redis, symbol=symbol, side=side, entry_price=entry,
+                        conviction=int(float(event_data.get("conviction", 0) or 0)),
+                        reason=f"shadow_only:{event_data.get('strategy', 'nexus')}",
+                        session=str(event_data.get("session", "")), verdict="SHADOW",
+                    )
+                log.info("executor.entry_blocked", reason=controls.block, symbol=symbol)
+                continue
+
+            rr = check_min_rr(entry, sl, tp, side, min_rr=float(os.getenv("NEXUS_MIN_RR", "1.5")))
+            if not rr["ok"]:
+                log.warning("executor.stream_min_rr_rejected", symbol=symbol, reason=rr["reason"])
                 continue
 
             # ── Dedup: skip if this symbol+direction was already executed ─
@@ -448,43 +468,6 @@ async def _execution_stream_consumer() -> None:
                 )
                 continue
 
-            # ── Kill switch check ─────────────────────────────────────
-            kill_switch = await redis.cache_get("system:kill_switch")
-            if kill_switch:
-                log.warning(
-                    "executor.kill_switch_active",
-                    symbol=symbol,
-                    side=side,
-                    size=size,
-                )
-                continue
-
-            # ── T10: Shadow-only mode — لا تنفيذ، تسجيل shadow_trades فقط ──
-            try:
-                session_state = await redis.cache_get("session:state")
-                _mode = (session_state or {}).get("mode", "paper") if isinstance(session_state, dict) else "paper"
-                if _mode == "shadow":
-                    from services.nexus_agents.shadow_trades import record_shadow_trade
-                    price = float(event_data.get("price", 0) or 0)
-                    if price > 0:
-                        await record_shadow_trade(
-                            redis,
-                            symbol=symbol,
-                            side=side,
-                            entry_price=price,
-                            conviction=int(float(event_data.get("conviction", 0) or 0)),
-                            reason=f"shadow_only:{str(event_data.get('strategy', 'nexus'))}",
-                            session=str(event_data.get("session", "")),
-                            verdict="SHADOW",
-                        )
-                    log.info(
-                        "executor.shadow_only_recorded",
-                        symbol=symbol, side=side, price=price,
-                    )
-                    continue
-            except Exception:
-                log.warning("executor.shadow_gate_failed — falling through", exc_info=True)
-
             strategy = str(event_data.get("strategy", event_data.get("source", "risk")))
             comment = normalize_nexus_comment(
                 str(event_data.get("comment", "")),
@@ -503,10 +486,11 @@ async def _execution_stream_consumer() -> None:
             )
 
             broker = await _get_broker()
-            result = await broker.send_order(order_req)
+            result = await dispatch_entry(redis, broker, order_req)
 
-            if result.is_success():
+            if result.status in (OrderStatus.FILLED, OrderStatus.PARTIAL, OrderStatus.PENDING, OrderStatus.UNCONFIRMED):
                 await _mark_order_executed(symbol, side)
+            if result.is_success():
                 await _store_trade_meta(result.order_id, {
                     "strategy": _strategy_from_comment(comment) or strategy,
                     "conviction": float(event_data.get("conviction", 0) or 0),
@@ -546,6 +530,8 @@ async def _execution_stream_consumer() -> None:
                 )
                 await redis.publish_event(RedisStream.POSITION_UPDATE, pos_event)
 
+        except EntryBlocked as exc:
+            log.warning("executor.entry_blocked", reason=str(exc))
         except Exception:
             log.exception("executor.stream_consumer.error")
 
@@ -818,7 +804,7 @@ async def _lifecycle_action_executor() -> None:
     while True:
         try:
             # Only run if kill switch is off
-            kill_switch = await redis.cache_get("system:kill_switch")
+            kill_switch = await halted(redis)
             if kill_switch:
                 await asyncio.sleep(LIFECYCLE_POLL_SEC)
                 continue
@@ -965,6 +951,9 @@ async def health():
 @app.post("/api/executor/order", response_model=OrderResponseModel)
 async def send_order(req: SendOrderRequest):
     try:
+        controls = await read_controls(redis)
+        if controls.block:
+            raise EntryBlocked(controls.block)
         if await _is_duplicate_order(req.symbol, req.side):
             log.info(
                 "executor.rest.dedup_skip",
@@ -1000,10 +989,7 @@ async def send_order(req: SendOrderRequest):
 
         # R-02: min R:R gate — INSIDE the executor, before MT5 send.
         # Historical bug: trades executed at R:R 1.2 and 0.0 despite 1.5 setting.
-        _entry_for_rr = req.price or (
-            req.ask if order_side == OrderSide.BUY and req.ask > 0 else
-            (req.bid if req.bid > 0 else 0.0)
-        )
+        _entry_for_rr = req.price or (req.ask if order_side == OrderSide.BUY else req.bid)
         _rr = check_min_rr(_entry_for_rr, req.sl, req.tp, req.side,
                            min_rr=float(os.getenv("NEXUS_MIN_RR", "1.5")))
         if not _rr["ok"]:
@@ -1043,6 +1029,13 @@ async def send_order(req: SendOrderRequest):
             order.order_type = decision.order_type
             if decision.adjusted:
                 order.price = decision.price
+            # Routing may change the entry. Do not keep an approval calculated
+            # against a different price, even for a protective limit order.
+            routed_rr = check_min_rr(decision.price, order.sl, order.tp, req.side,
+                                     min_rr=float(os.getenv("NEXUS_MIN_RR", "1.5")))
+            if not routed_rr["ok"]:
+                return OrderResponseModel(symbol=req.symbol, side=req.side.upper(),
+                                          status="MIN_RR_REJECTED", error=routed_rr["reason"])
             routing_info = {
                 "order_type": decision.order_type.value,
                 "price": decision.price,
@@ -1052,10 +1045,11 @@ async def send_order(req: SendOrderRequest):
             }
 
         broker = await _get_broker()
-        result = await broker.send_order(order)
+        result = await dispatch_entry(redis, broker, order)
 
-        if result.is_success():
+        if result.status in (OrderStatus.FILLED, OrderStatus.PARTIAL, OrderStatus.PENDING, OrderStatus.UNCONFIRMED):
             await _mark_order_executed(req.symbol, req.side)
+        if result.is_success():
             await _store_trade_meta(result.order_id, {
                 "strategy": req.strategy or _strategy_from_comment(order.comment),
                 "conviction": req.conviction,
@@ -1097,6 +1091,9 @@ async def send_order(req: SendOrderRequest):
             broker=result.broker,
             routing=routing_info,
         )
+    except EntryBlocked as exc:
+        log.warning("executor.entry_blocked", reason=str(exc), symbol=req.symbol)
+        return OrderResponseModel(symbol=req.symbol, side=req.side, status="ENTRY_BLOCKED", error=str(exc))
     except Exception as exc:
         log.exception("executor.send_order.error")
         raise HTTPException(status_code=500, detail=str(exc))

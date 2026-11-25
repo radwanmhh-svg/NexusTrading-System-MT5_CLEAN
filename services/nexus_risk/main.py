@@ -29,6 +29,8 @@ from shared.constants import (
 from shared.events import RiskDecisionEvent, TradeCloseEvent
 from shared.models import CircuitBreaker, RiskState, TradeProposal
 from shared.nexus_trades import is_nexus_comment, partition_positions
+from shared.execution_receipt import execution_veto
+from shared.trade_controls import halted
 from shared.redis_client import RedisClient
 from shared.sessions import detect_session_now
 from shared import runtime_settings
@@ -299,7 +301,7 @@ async def _risk_stream_consumer() -> None:
     ):
         try:
             # ── Kill switch check ─────────────────────────────────────
-            kill_switch = await redis.cache_get("system:kill_switch")
+            kill_switch = await halted(redis)
             if kill_switch:
                 log.warning(
                     "risk.kill_switch_active",
@@ -319,7 +321,7 @@ async def _risk_stream_consumer() -> None:
                 continue
 
             event_data = event.data if isinstance(event.data, dict) else {}
-            already_executed = bool(event_data.get("already_executed"))
+            already_executed = execution_veto(event_data, "already_executed")
 
             # ── P9 Decision Engine gate (independent of the debate) ──
             # Re-checks: economic blackout, regime, conviction and portfolio
@@ -393,7 +395,7 @@ async def _risk_stream_consumer() -> None:
             proposal = TradeProposal(**proposal_data)
             result = await _evaluate_proposal(proposal, _current_state)
 
-            skip_execution = already_executed and result["decision"] == RiskDecision.APPROVE
+            skip_execution = already_executed or execution_veto(event_data, "skip_execution")
             decision_event = RiskDecisionEvent(
                 source=SERVICE_NAME,
                 correlation_id=event.correlation_id,

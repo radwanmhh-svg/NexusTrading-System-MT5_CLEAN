@@ -256,17 +256,27 @@ def sample_news_item() -> NewsItem:
 # ── HTTP Test Client (FastAPI) ───────────────────────────────────────────────
 
 @pytest_asyncio.fixture()
-async def api_client(redis_client: RedisClient) -> AsyncIterator[AsyncClient]:
+async def api_client() -> AsyncIterator[AsyncClient]:
     """Build an AsyncClient wired to the nexus-api app with mocked deps."""
+    from fakeredis.aioredis import FakeRedis as TransactionalRedis
     from services.nexus_api.main import app
     from services.nexus_api.deps import get_redis, get_duckdb
 
     mock_db = AsyncMock()
     mock_db.query = AsyncMock(return_value=[])
 
+    # This router uses MULTI/EXEC and WATCH, not just cache_get/cache_set.
+    redis_client = RedisClient()
+    redis_client._redis = TransactionalRedis(decode_responses=True)
+    saved = app.dependency_overrides.copy()
     app.dependency_overrides[get_redis] = lambda: redis_client
     app.dependency_overrides[get_duckdb] = lambda: mock_db
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(saved)
+        await redis_client.disconnect()

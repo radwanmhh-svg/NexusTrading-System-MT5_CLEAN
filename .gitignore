@@ -48,3 +48,4 @@ backups/
 .claude/
 .vscode/
 LOCAL-REVIEW*.txt
+*.tsbuildinfo
