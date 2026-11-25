@@ -27,6 +27,7 @@ from shared.events import (
     Event,
     SignalEvent,
 )
+from shared.trade_controls import halted
 from shared.redis_client import RedisClient
 
 from .graph import build_graph
@@ -165,7 +166,7 @@ async def _run_evaluation_cycle(
     cycle_id = cycle_id or uuid.uuid4().hex[:12]
 
     # ── Kill switch check ─────────────────────────────────────
-    kill_switch = await redis_client.cache_get("system:kill_switch")
+    kill_switch = await halted(redis_client)
     if kill_switch:
         await logger.awarning(
             "cycle.kill_switch_active",
@@ -386,9 +387,9 @@ async def _publish_results(state: AgentState, cycle_id: str) -> None:
         verdict_data["ask"] = order.get("ask", 0)
         verdict_data["comment"] = order.get("comment", "")
         verdict_data["strategy"] = order.get("strategy", "genai")
-        # A9 already sent the order via REST — tell risk/executor not to duplicate
-        if str(order.get("status", "")).lower() == "sent":
-            verdict_data["already_executed"] = True
+        if order.get("submission_attempted"):
+            verdict_data["skip_execution"] = True  # do not replay rejected/ambiguous attempts either
+            verdict_data["already_executed"] = order.get("status") in {"filled", "partial"}
             verdict_data["order_id"] = (order.get("broker_response") or {}).get("order_id", "")
 
     verdict_event = AgentVerdictEvent(

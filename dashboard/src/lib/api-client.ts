@@ -197,7 +197,7 @@ class ApiClient {
     return localStorage.getItem('nexus-token');
   }
 
-  private async fetchPath(path: string, options: RequestInit = {}): Promise<Response> {
+  private async fetchPath(path: string, options: RequestInit = {}, redirectOnUnauthorized = true): Promise<Response> {
     const token = this.getToken();
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -213,7 +213,7 @@ class ApiClient {
       headers,
     });
 
-    if (res.status === 401) {
+    if (res.status === 401 && redirectOnUnauthorized) {
       if (typeof window !== 'undefined') {
         localStorage.removeItem('nexus-token');
         window.location.href = '/login';
@@ -589,29 +589,41 @@ class ApiClient {
     return wrap(data);
   }
 
+  async systemGetMode(): Promise<ApiResponse<unknown>> {
+    const res = await this.fetchPath('/api/system/mode', { cache: 'no-store', signal: AbortSignal.timeout(5000) }, false);
+    return wrap(await this.parseOk<unknown>(res));
+  }
+
+  async systemReleaseHalt(pin: string): Promise<ApiResponse<Record<string, unknown>>> {
+    const res = await this.fetchPath('/api/system/kill-switch/release', {
+      method: 'POST', signal: AbortSignal.timeout(5000), body: JSON.stringify({ pin }),
+    }, false);
+    return wrap(await this.parseOk<Record<string, unknown>>(res));
+  }
+
   async systemKillSwitch(pin: string, reason = 'manual kill-switch'): Promise<ApiResponse<Record<string, unknown>>> {
     const res = await this.fetchPath('/api/system/kill-switch', {
-      method: 'POST',
+      method: 'POST', signal: AbortSignal.timeout(5000),
       body: JSON.stringify({ pin, reason }),
-    });
+    }, false);
     const data = await this.parseOk<Record<string, unknown>>(res);
     return wrap(data);
   }
 
-  async systemToggleAutoTrade(enabled: boolean): Promise<ApiResponse<Record<string, unknown>>> {
+  async systemToggleAutoTrade(enabled: boolean, expectedMode?: string): Promise<ApiResponse<Record<string, unknown>>> {
     const res = await this.fetchPath('/api/system/toggle-auto-trade', {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-    });
+      method: 'POST', signal: AbortSignal.timeout(5000),
+      body: JSON.stringify({ enabled, expected_mode: expectedMode }),
+    }, false);
     const data = await this.parseOk<Record<string, unknown>>(res);
     return wrap(data);
   }
 
-  async systemSwitchMode(mode: 'paper' | 'live', pin?: string): Promise<ApiResponse<Record<string, unknown>>> {
+  async systemSwitchMode(mode: 'paper' | 'shadow' | 'backtest' | 'live', pin?: string): Promise<ApiResponse<Record<string, unknown>>> {
     const res = await this.fetchPath('/api/system/mode', {
-      method: 'POST',
+      method: 'POST', signal: AbortSignal.timeout(5000),
       body: JSON.stringify({ mode, pin }),
-    });
+    }, false);
     const data = await this.parseOk<Record<string, unknown>>(res);
     return wrap(data);
   }

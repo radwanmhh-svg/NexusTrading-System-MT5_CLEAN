@@ -14,6 +14,7 @@ D-05 (max drawdown): per-trade equity curve, not per-day.
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Sequence
 
 
@@ -99,14 +100,17 @@ def check_min_rr(
     reason (never sent silently unprotected).
     """
     side_u = str(side or "").upper()
-    if entry_price <= 0 or sl <= 0 or tp <= 0:
+    if not all(math.isfinite(v) and v > 0 for v in (entry_price, sl, tp, min_rr)):
         return {"ok": False, "rr": 0.0,
-                "reason": "MIN_RR: missing entry/SL/TP — order not sent unprotected"}
+                "reason": "MIN_RR: missing or invalid entry/SL/TP/threshold — order not sent"}
     sl_distance = abs(entry_price - sl)
     tp_distance = abs(tp - entry_price)
     if sl_distance <= 0:
         return {"ok": False, "rr": 0.0, "reason": "MIN_RR: zero SL distance"}
     rr = tp_distance / sl_distance
+    if not ((side_u == "BUY" and sl < entry_price < tp) or
+            (side_u == "SELL" and tp < entry_price < sl)):
+        return {"ok": False, "rr": round(rr, 3), "reason": "MIN_RR: invalid direction or inverted SL/TP"}
     if rr < min_rr:
         return {
             "ok": False,

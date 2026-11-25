@@ -109,7 +109,9 @@ class IBKRExecutor(BrokerAdapter):
                 fill_price = trade.fills[-1].execution.price
                 filled_size = sum(f.execution.shares for f in trade.fills)
 
-            if trade.orderStatus.status in ("Filled",):
+            if 0 < filled_size < order.size:
+                status = OrderStatus.PARTIAL
+            elif trade.orderStatus.status in ("Filled",):
                 status = OrderStatus.FILLED
             elif trade.orderStatus.status in ("Submitted", "PreSubmitted"):
                 status = OrderStatus.PENDING
@@ -137,7 +139,7 @@ class IBKRExecutor(BrokerAdapter):
                 order_type=order.order_type.value,
                 requested_price=order.price,
                 fill_price=fill_price,
-                size=filled_size or order.size,
+                size=filled_size,
                 sl=order.sl,
                 tp=order.tp,
                 status=status,

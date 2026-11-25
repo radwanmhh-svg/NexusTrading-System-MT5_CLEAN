@@ -27,6 +27,7 @@ import structlog
 import yaml
 
 from shared.constants import DEFAULT_RISK_PARAMS
+from shared.trade_controls import halted
 from shared.redis_client import RedisClient
 
 from ..state import AgentState
@@ -296,12 +297,12 @@ class RiskManagerAgent(BaseAgent):
         # nexus_risk's _evaluate_proposal().
         try:
             if self.redis_client:
-                ks = await self.redis_client.cache_get("system:kill_switch")
+                ks = await halted(self.redis_client)
                 if ks:
                     breakers.append({
                         "name": "kill_switch",
                         "triggered": True,
-                        "reason": f"System kill switch active: {ks.get('reason', 'unknown')}",
+                        "reason": "System kill switch active",
                         "value": ks,
                     })
         except Exception:

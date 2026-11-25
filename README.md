@@ -21,7 +21,7 @@
 
 ---
 
-> ⚠️ **Disclaimer.** This is a research and portfolio project. Trading leveraged instruments (Gold, crypto CFDs) carries substantial risk of loss. The repository ships **no credentials** and connects to a **demo account** by default. Nothing here is financial advice. Use at your own risk.
+> ⚠️ **Disclaimer.** This is a research and portfolio project. Trading leveraged instruments (Gold, crypto CFDs) carries substantial risk of loss. This review branch defaults to **no new entries**; a selected PAPER mode is not proof of a demo account. See [entry controls, adapter requirements and test instructions](docs/confirmed-trade-controls.md). Nothing here is financial advice. Use at your own risk.
 
 ---
 

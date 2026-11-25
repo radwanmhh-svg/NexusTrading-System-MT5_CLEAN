@@ -68,7 +68,9 @@ async def update_settings(
     cfg: ConfigLoader = Depends(get_config),
     redis: RedisClient = Depends(get_redis),
 ) -> dict[str, Any]:
-    current = cfg.get("settings") or cfg.load_settings()
+    if {"trading_mode", "auto_trade_enabled"} & body.settings.keys():
+        raise HTTPException(409, "Execution controls must be changed via /api/system, not preferences")
+    current = dict(cfg.get("settings") or cfg.load_settings())
     current.update(body.settings)
     try:
         validated = SettingsSchema(**current)

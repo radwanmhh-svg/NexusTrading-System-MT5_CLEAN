@@ -17,6 +17,7 @@ import yaml
 
 from shared.asset_specs import get_asset_spec, round_price
 from shared.nexus_trades import build_nexus_comment
+from shared.execution_receipt import receipt_state
 from shared.redis_client import RedisClient
 from shared.sl_tp import compute_sltp
 
@@ -167,25 +168,23 @@ class TradeExecutorAgent(BaseAgent):
         except Exception:
             llm_review = "LLM unavailable — using computed order params."
 
+        order["submission_attempted"] = True
         try:
             result = await send_order(order)
-            order["broker_response"] = result
-            broker_status = str(result.get("status", "")).upper()
-            order["status"] = (
-                "sent"
-                if broker_status in {"FILLED", "PARTIAL", "PENDING", "PLACED"}
-                else "failed"
-            )
-            if order["status"] == "sent":
-                await record_trade()
-            elif order["status"] == "failed":
-                state["errors"].append(
-                    f"A9: broker rejected order: {result.get('error') or result}"
-                )
+            order["broker_response"] = result if isinstance(result, dict) else {}
+            order["status"] = receipt_state(result)
         except Exception as exc:
             order["broker_response"] = {"error": str(exc)}
-            order["status"] = "failed"
-            state["errors"].append(f"A9: send_order failed: {exc}")
+            order["status"] = "unconfirmed"
+
+        if order["status"] in {"filled", "partial", "pending", "unconfirmed"}:
+            # Reserve the existing frequency/risk slot conservatively even when
+            # the acknowledgement was lost. This counter is not a fill journal.
+            await record_trade()
+        if order["status"] == "unconfirmed":
+            state["errors"].append("A9: execution unconfirmed; reconcile before resubmission")
+        elif order["status"] in {"rejected", "cancelled"}:
+            state["errors"].append(f"A9: order {order['status']}: {order['broker_response']}")
 
         state["order"] = order
         state["messages"].append({

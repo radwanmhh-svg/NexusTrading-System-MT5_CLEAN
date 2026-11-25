@@ -32,6 +32,7 @@ class OrderStatus(StrEnum):
     PENDING   = "PENDING"
     FILLED    = "FILLED"
     PARTIAL   = "PARTIAL"
+    UNCONFIRMED = "UNCONFIRMED"
     CANCELLED = "CANCELLED"
     REJECTED  = "REJECTED"
     ERROR     = "ERROR"
@@ -83,6 +84,8 @@ class AccountInfo:
     currency: str = "USD"
     broker: str = ""
     server: str = ""
+    # Only set from an authenticated adapter/session, never from a UI flag.
+    execution_mode: str | None = None
 
 
 class BrokerAdapter(ABC):

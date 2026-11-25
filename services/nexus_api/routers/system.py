@@ -3,19 +3,21 @@ System router — health dashboard, kill-switch, auto-trade toggle, mode switch.
 """
 from __future__ import annotations
 
+from inspect import isawaitable
 from typing import Any
 
 import structlog
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
-from shared.constants import REDIS_KEY_PREFIX, ServiceName, TradingMode
+from shared.constants import ServiceName, TradingMode
+from shared.trade_controls import EntryBlocked, read_controls, set_auto, set_manual_halt, set_mode
 from shared.models import SystemHealth
 from shared.redis_client import RedisClient
 from shared.service_urls import data_service_url as _dsvc
 
-from ..deps import get_config, get_redis
+from ..deps import get_redis
 from ..middleware.auth import verify_pin
 
 logger = structlog.get_logger(__name__)
@@ -31,7 +33,8 @@ class KillSwitchRequest(BaseModel):
 
 
 class ToggleAutoTradeRequest(BaseModel):
-    enabled: bool
+    enabled: StrictBool
+    expected_mode: TradingMode | None = None
 
 
 class SwitchModeRequest(BaseModel):
@@ -42,12 +45,28 @@ class SwitchModeRequest(BaseModel):
 class ModeResponse(BaseModel):
     mode: TradingMode
     auto_trade: bool
+    auto_requested: bool
+    manual_halt: bool
+    risk_halt: bool
+    entry_block: str | None = None
     # D-03: set when reconcile() reports |diff| > $0.01 — honest surfacing.
     reconcile_paused: str | None = None
     reconcile_diff: float | None = None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
+
+async def _require_pin(pin: str) -> None:
+    # Delegate to the server verifier, never a browser value or fallback PIN.
+    if not pin or not pin.strip():
+        raise HTTPException(403, "Gateway PIN required")
+    verified = verify_pin(pin)
+    if isawaitable(verified):
+        verified = await verified
+    # Existing raise-on-denial verifiers may return None on success.
+    if verified is not None and verified is not True:
+        raise HTTPException(403, "Invalid gateway PIN")
+
 
 @router.get("/health", response_model=list[SystemHealth])
 async def system_health(
@@ -70,16 +89,24 @@ async def kill_switch(
     body: KillSwitchRequest,
     redis: RedisClient = Depends(get_redis),
 ) -> dict[str, str]:
-    """EMERGENCY STOP — close all positions, halt all agents."""
-    verify_pin(body.pin)
-    await redis.cache_set("system:kill_switch", True, ttl_sec=86400)
-    await redis.cache_set("system:auto_trade", False, ttl_sec=86400)
-    await redis.publish_channel(
-        "system:commands",
-        {"command": "kill_switch", "reason": body.reason},
-    )
+    """Latch subsequent new entries; do not liquidate or recall in-flight orders."""
+    await _require_pin(body.pin)
+    await set_manual_halt(redis, True)
+    # The latch is authoritative; a notification failure does not undo it.
+    try:
+        await redis.publish_channel("system:commands", {"command": "kill_switch", "reason": body.reason})
+    except Exception:
+        logger.warning("system.kill_notification_unavailable")
     await logger.awarning("KILL_SWITCH activated", reason=body.reason)
     return {"status": "kill_switch_activated", "reason": body.reason}
+
+
+@router.post("/kill-switch/release")
+async def release_manual_halt(body: KillSwitchRequest, redis: RedisClient = Depends(get_redis)) -> dict:
+    """Only release the operator latch. AUTO stays off and risk holds are retained."""
+    await _require_pin(body.pin)
+    await set_manual_halt(redis, False)
+    return {"status": "manual_halt_released", "auto_trade": False}
 
 
 @router.post("/toggle-auto-trade")
@@ -87,7 +114,10 @@ async def toggle_auto_trade(
     body: ToggleAutoTradeRequest,
     redis: RedisClient = Depends(get_redis),
 ) -> dict[str, Any]:
-    await redis.cache_set("system:auto_trade", body.enabled, ttl_sec=86400)
+    try:
+        await set_auto(redis, body.enabled, body.expected_mode)
+    except EntryBlocked as exc:
+        raise HTTPException(503 if str(exc) == "controls_unavailable" else 409, str(exc)) from exc
     state = "enabled" if body.enabled else "disabled"
     await logger.ainfo("auto_trade.toggled", enabled=body.enabled)
     return {"auto_trade": body.enabled, "message": f"Auto-trade {state}"}
@@ -97,50 +127,17 @@ async def toggle_auto_trade(
 async def get_mode(
     redis: RedisClient = Depends(get_redis),
 ) -> dict[str, Any]:
-    mode = TradingMode.PAPER
     try:
-        session = await redis.cache_get("session:state")
-        if session and isinstance(session, dict):
-            raw_mode = session.get("mode", "paper")
-            try:
-                mode = TradingMode(raw_mode) if isinstance(raw_mode, str) else TradingMode.PAPER
-            except ValueError:
-                mode = TradingMode.PAPER
-    except Exception:
-        pass
-
-    auto_trade = await redis.cache_get("system:auto_trade")
-
-    # D-03: reconcile failure forces AUTO=false server-side (not UI-only).
-    reconcile_paused: str | None = None
-    reconcile_diff: float | None = None
-    try:
-        raw_paused = await redis.r.get("nexus:reconcile:auto_paused")
-        if raw_paused:
-            reconcile_paused = str(raw_paused)
-            auto_trade = False
-            try:
-                reconcile_diff = float(reconcile_paused.split("=", 1)[1])
-            except Exception:
-                reconcile_diff = None
-    except Exception:
-        pass
-
-    # T15.7: المتبقي قبل انسحاب وضع الجلسة تلقائياً (session:state TTL يوم)
-    session_ttl = None
-    try:
-        ttl = await redis.r.ttl(f"{REDIS_KEY_PREFIX}session:state")
-        session_ttl = int(ttl) if ttl and ttl > 0 else None
-    except Exception:
-        session_ttl = None
-
-    return {
-        "mode": mode,
-        "auto_trade": bool(auto_trade) if auto_trade is not None else True,
-        "session_ttl_sec": session_ttl,
-        "reconcile_paused": reconcile_paused,
-        "reconcile_diff": reconcile_diff,
-    }
+        snapshot = await read_controls(redis)
+    except EntryBlocked as exc:
+        raise HTTPException(503, "controls_unavailable") from exc
+    payload = snapshot.payload()
+    if snapshot.pause:
+        try:
+            payload["reconcile_diff"] = float(snapshot.pause.split("=", 1)[1])
+        except (ValueError, IndexError):
+            pass
+    return payload
 
 
 @router.post("/mode", response_model=ModeResponse)
@@ -154,23 +151,18 @@ async def switch_mode(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "PIN required to switch to live mode",
             )
-        verify_pin(body.pin)
+        await _require_pin(body.pin)
 
-    session = await redis.cache_get("session:state") or {}
-    if isinstance(session, dict):
-        session["mode"] = body.mode
-    else:
-        session = {"mode": body.mode}
-    await redis.cache_set("session:state", session, ttl_sec=86400)
-
-    await redis.publish_channel(
-        "system:commands",
-        {"command": "mode_switch", "mode": body.mode},
-    )
-    await logger.ainfo("mode.switched", mode=body.mode)
-
-    auto_trade = await redis.cache_get("system:auto_trade")
-    return {"mode": body.mode, "auto_trade": bool(auto_trade) if auto_trade is not None else False}
+    try:
+        await set_mode(redis, body.mode)
+    except EntryBlocked as exc:
+        raise HTTPException(409, str(exc)) from exc
+    try:
+        await redis.publish_channel("system:commands", {"command": "mode_switch", "mode": body.mode.value})
+    except Exception:
+        logger.warning("system.mode_notification_unavailable")
+    await logger.ainfo("mode.switched", mode=body.mode.value)
+    return await get_mode(redis)
 
 
 @router.get("/reconcile")
